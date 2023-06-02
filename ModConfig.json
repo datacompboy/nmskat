@@ -1,0 +1,21 @@
+{
+  "ModId": "nmskat",
+  "ModName": "No Man's Sky: Kat integration",
+  "ModAuthor": "datacompboy",
+  "ModVersion": "1.0.0",
+  "ModDescription": "Description",
+  "ModDll": "nmskat.dll",
+  "ModIcon": "Preview.png",
+  "ModR2RManagedDll32": "x86/nmskat.dll",
+  "ModR2RManagedDll64": "x64/nmskat.dll",
+  "ModNativeDll32": "",
+  "ModNativeDll64": "",
+  "IsLibrary": false,
+  "ReleaseMetadataFileName": "nmskat.ReleaseMetadata.json",
+  "PluginData": {},
+  "IsUniversalMod": false,
+  "ModDependencies": [ "reloaded.sharedlib.hooks" ],
+  "OptionalDependencies": [],
+  "SupportedAppId": [],
+  "ProjectUrl": ""
+}
