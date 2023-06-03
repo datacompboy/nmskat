@@ -25,7 +25,9 @@ public class Config : Configurable<Config>
 
         The `DefaultValue` attribute is used as part of the `Reset` button in Reloaded-Launcher.
     */
-
+    /*
+     * Initial release: no configuration.
+     * 
     [DisplayName("String")]
     [Description("This is a string.")]
     [DefaultValue("Default Name")]
@@ -101,6 +103,7 @@ public class Config : Configurable<Config>
         multiSelect: true,
         forceFileSystem: true)]
     public string Folder { get; set; } = "";
+    */
 }
 
 /// <summary>

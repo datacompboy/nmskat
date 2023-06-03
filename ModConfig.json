@@ -14,8 +14,8 @@
   "ReleaseMetadataFileName": "nmskat.ReleaseMetadata.json",
   "PluginData": {},
   "IsUniversalMod": false,
-  "ModDependencies": [ "reloaded.sharedlib.hooks" ],
+  "ModDependencies": [ "reloaded.sharedlib.hooks", "Reloaded.Memory.SigScan.ReloadedII" ],
   "OptionalDependencies": [],
-  "SupportedAppId": [],
+  "SupportedAppId": [ "nms.exe", "nms.exe.unpacked.exe" ],
   "ProjectUrl": ""
 }
