@@ -11,6 +11,7 @@ using Reloaded.Hooks;
 using Reloaded.Memory;
 using Reloaded.Memory.Interfaces;
 using Reloaded.Hooks.Definitions.X64;
+using System.ComponentModel;
 
 namespace nmskat;
 
@@ -56,12 +57,13 @@ public class Mod : ModBase // <= Do not Remove.
     private nuint hKatDll;
 
     [Reloaded.Hooks.Definitions.X64.Function(CallingConventions.Microsoft)]
-    private delegate void GetWalkStatus(out KATTreadMillMemoryData result, nuint treadmill);
+    private delegate void FunGetWalkStatus(out KATTreadMillMemoryData result, nuint treadmill);
 
     /// <summary>
     /// Address of GetWalkStatus function from Kat SDK
     /// </summary>
-    private static Reloaded.Hooks.Definitions.IFunctionPtr<GetWalkStatus>? fGetWalkStatus;
+    private static Reloaded.Hooks.Definitions.IFunction<FunGetWalkStatus>? fGetWalkStatus;
+    private static FunGetWalkStatus? GetWalkStatusWrapper;
 
     /// <summary>
     /// Hook to rotation handling code (against garbage collection)
@@ -80,6 +82,7 @@ public class Mod : ModBase // <= Do not Remove.
 
         if (LoadKatNative())
         {
+            TouchKatWalk();
             _logger.WriteLine("Kat SDK loaded, injecting code");
             SetupLookHook();
         }
@@ -133,7 +136,7 @@ public class Mod : ModBase // <= Do not Remove.
             _logger.WriteLine("The gap is too far away,");
             throw new Exception("The gap is too far away.");
         }
-        var hook_jmp_address = baseAddress + result.Offset;
+        var hook_jmp_address = do_turn_address + result.Offset;
         _logger.WriteLine($"Hook jmp: {(nuint)hook_jmp_address}");
 
         string[] turnAdapterHook =
@@ -142,24 +145,23 @@ public class Mod : ModBase // <= Do not Remove.
              // Get the rotation delta
             $"{_hooks!.Utilities.GetAbsoluteCallMnemonics<NoArgsRetByte>(_GetTurnAngleDiff, out _GetTurnAngleDiffReverse)}",
             // Check is no rotation needed
-            "cmp al, 0",                               
+            "cmp al, 0",
             // If no rotation needed, load skip address
-            $"mov rcx, qword {(nuint)no_turn_needed_address}",
-            "CMOVNZ rax, rcx",
+            $"mov rax, qword {(nuint)no_turn_needed_address}",
             // Otherwise load saving address
             $"mov rcx, qword {(nuint)do_turn_address}",
-            $"CMOVZ rax, rcx",
+            $"cmovne rax, rcx",
             // Load the turn diff into xmm7
             $"mov rcx, qword {(nuint)(_angleDiff)}",
             "movss xmm7, [rcx]",
             // return from hook to either do_turn or no_turn_needed
-            "jmp qword [rax]"
+            "jmp rax"
         };
 
         _logger.WriteLine($"Jump hook: {String.Join("\n", turnAdapterHook)}");
         try
         {
-            rotationHook = _hooks.CreateAsmHook(turnAdapterHook, (long)hook_jmp_address, AsmHookBehaviour.DoNotExecuteOriginal).Activate();
+            rotationHook = _hooks!.CreateAsmHook(turnAdapterHook, (long)hook_jmp_address, AsmHookBehaviour.DoNotExecuteOriginal).Activate();
         }
         catch(Exception e)
         {
@@ -177,37 +179,29 @@ public class Mod : ModBase // <= Do not Remove.
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     private struct Quaternion
     {
-        float x;
-        float y;
-        float z;
+        public float x;
+        public float y;
+        public float z;
         public float w;
     };
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     private struct Vector3
     {
-        float x;
-        float y;
-        float z;
-    };
-    
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private unsafe struct TreadMillData
-    {
-        fixed char deviceName[64];
-        bool connected;
-        double lastUpdateTimePoint;
-
-        public Quaternion bodyRotationRaw;
-
-        Vector3 moveSpeed;
+        public float x;
+        public float y;
+        public float z;
     };
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1, Size = 384)]
     private unsafe struct KATTreadMillMemoryData
     {
-        public TreadMillData treadMillData;
-        fixed char extraData[256];
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string deviceName;
+        public byte connected;
+        public double lastUpdateTimePoint;
+        public Quaternion bodyRotationRaw;
+        public Vector3 moveSpeed;
     };
 
 
@@ -219,12 +213,11 @@ public class Mod : ModBase // <= Do not Remove.
 
     private IReverseWrapper<NoArgsRetByte>? _GetTurnAngleDiffReverse;
 
-    [Function(CallingConventions.Microsoft)]
     private static byte _GetTurnAngleDiff()
     {
-        KATTreadMillMemoryData newdata;
-        fGetWalkStatus!.GetDelegate()(out newdata, 0);
-        float angle = (float)(2.0f * Math.Acos(newdata.treadMillData.bodyRotationRaw.w));
+        KATTreadMillMemoryData data;
+        GetWalkStatusWrapper!(out data, 0);
+        float angle = (float)(2.0f * Math.Acos(data.bodyRotationRaw.w));
         float diff = angle - _lastAngle;
         if (Math.Abs(diff) > 0.001) {
             unsafe { *_angleDiff = diff; }
@@ -253,9 +246,26 @@ public class Mod : ModBase // <= Do not Remove.
             // return false;
         }
 
-        fGetWalkStatus = _hooks!.CreateFunctionPtr<GetWalkStatus>(addrGetWalkStatus);
+        fGetWalkStatus = _hooks!.CreateFunction<FunGetWalkStatus>((long)addrGetWalkStatus);
+        GetWalkStatusWrapper = fGetWalkStatus.GetWrapper();
 
         return true;
+    }
+
+    private unsafe void TouchKatWalk()
+    {
+        KATTreadMillMemoryData newdata;
+        GetWalkStatusWrapper!(out newdata, 0);
+        _logger.WriteLine($"Kat: '{newdata.deviceName}' connected: {newdata.connected}");
+        _logger.WriteLine($"Rotation Q/w: {newdata.bodyRotationRaw.x} {newdata.bodyRotationRaw.y} {newdata.bodyRotationRaw.z} {newdata.bodyRotationRaw.w}");
+        _logger.WriteLine($"Offset: {Marshal.OffsetOf<KATTreadMillMemoryData>("bodyRotationRaw")}");
+
+        // throw new Exception("KAT is not connected");
+
+        if (_GetTurnAngleDiff() != 0)
+            _logger.WriteLine($"Turn platform angle changed by: {*_angleDiff}.");
+        else
+            _logger.WriteLine("Platform angle hasn't changed.");
     }
 
     #region Native Imports
