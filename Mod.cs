@@ -20,6 +20,7 @@ namespace nmskat;
 /// </summary>
 public class Mod : ModBase // <= Do not Remove.
 {
+    #region Standard Mod Variables
     /// <summary>
     /// Provides access to the mod loader API.
     /// </summary>
@@ -50,44 +51,149 @@ public class Mod : ModBase // <= Do not Remove.
     /// The configuration of the currently executing mod.
     /// </summary>
     private readonly IModConfig _modConfig;
+    #endregion
+
+
+    #region KAT SDK API
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct katQuaternion
+    {
+        public float x;
+        public float y;
+        public float z;
+        public float w;
+
+        public System.Numerics.Quaternion ToQuaternion()
+        {
+            return new System.Numerics.Quaternion(x, y, z, w);
+        }
+        public float GetAngle()
+        {
+            // Simplified version of (Quaternion(vector(0, -1, 0), 90degree) * katQuaternion).ToAngle()
+            // works for real KatWalk C2+ (for some reason, has issue with simulator from the SDK...)
+            return 2.0f * (float)Math.Acos(0.707106781186547524401 * (w + y));
+        }
+    };
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct katVector3
+    {
+        public float x;
+        public float y;
+        public float z;
+    };
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1, Size = 384)]
+    private unsafe struct KATTreadMillMemoryData
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string deviceName;
+        public byte connected; // 1-byte Bool, https://stackoverflow.com/questions/32110152/c-sharp-marshalling-bool
+        public double lastUpdateTimePoint;
+        public katQuaternion bodyRotationRaw;
+        public katVector3 moveSpeed;
+    };
+
+    [Reloaded.Hooks.Definitions.X64.Function(CallingConventions.Microsoft)]
+    private delegate void FunGetWalkStatus(out KATTreadMillMemoryData result, nuint treadmill);
 
     /// <summary>
     /// Handle of KATNativeSDK.dll
     /// </summary>
     private nuint hKatDll;
 
-    [Reloaded.Hooks.Definitions.X64.Function(CallingConventions.Microsoft)]
-    private delegate void FunGetWalkStatus(out KATTreadMillMemoryData result, nuint treadmill);
-
     /// <summary>
     /// Address of GetWalkStatus function from Kat SDK
     /// </summary>
     private static Reloaded.Hooks.Definitions.IFunction<FunGetWalkStatus>? fGetWalkStatus;
+
+    /// <summary>
+    /// GC-protected wrapper for generated GetWalkStatus adapter wrapper
+    /// </summary>
     private static FunGetWalkStatus? GetWalkStatusWrapper;
 
     /// <summary>
-    /// Hook to rotation handling code (against garbage collection)
+    /// Try Load KATNativeSDK
+    /// </summary>
+    /// <returns></returns>
+    private bool LoadKatNative()
+    {
+        hKatDll = LoadLibraryW("KATNativeSDK.dll");
+        _logger.WriteLine($"hKatDll = {hKatDll}");
+        if (hKatDll == 0)
+        {
+            _logger.WriteLine("Can't load KATNativeSDK.dll");
+            return false;
+        }
+
+        var addrGetWalkStatus = GetProcAddress(hKatDll, "GetWalkStatus");
+        _logger.WriteLine($"addrGetWalkStatus = {addrGetWalkStatus}");
+        if (addrGetWalkStatus == 0)
+        {
+            _logger.WriteLine("Can't find address of GetWalkStatus");
+            return false;
+        }
+
+        fGetWalkStatus = _hooks!.CreateFunction<FunGetWalkStatus>((long)addrGetWalkStatus);
+        GetWalkStatusWrapper = fGetWalkStatus.GetWrapper();
+
+        return true;
+    }
+    #endregion
+
+
+    #region Hook and installer
+    /// <summary>
+    /// Incremental turn accumulator to avoid long time drift
+    /// </summary>
+    private static float _lastAngle = 0.0f;
+
+    /// <summary>
+    /// Latest computed difference between current treadmill direction and last-known direction.
+    /// 
+    /// Stored as a pointer to an allocated memory, so injected hook code can trivially read it.
+    /// </summary>
+    private static unsafe float* _angleDiff = (float*)Marshal.AllocHGlobal(sizeof(float));
+
+    [Function(CallingConventions.Microsoft)]
+    public delegate byte NoArgsRetByte();
+    /// <summary>
+    /// Wrapper for the C# precomputation hook function
+    /// </summary>
+    private IReverseWrapper<NoArgsRetByte>? _GetTurnAngleDiffReverse;
+
+    const float M_2PI = (float)(2.0 * Math.PI);
+    /// <summary>
+    /// Compute angle difference since last call in *_angleDiff memory.
+    /// </summary>
+    /// <returns>1 if treadmill rotated since last time.</returns>
+    private static byte _GetTurnAngleDiff()
+    {
+        KATTreadMillMemoryData data;
+        GetWalkStatusWrapper!(out data, 0);
+        float angle = data.bodyRotationRaw.GetAngle();
+        if (Math.Abs(angle - _lastAngle) > 0.0001)
+        {
+            float diff = _lastAngle - angle;
+            if (diff > Math.PI) diff -= M_2PI;
+            else if (diff < -Math.PI) diff += M_2PI;
+            unsafe { *_angleDiff = diff; }
+            _lastAngle += diff;
+            if (_lastAngle < 0) _lastAngle += M_2PI;
+            else if (_lastAngle > M_2PI) _lastAngle -= M_2PI;
+            return 1;
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Rotation handling code hook (GC protector)
     /// </summary>
     private IAsmHook? rotationHook;
 
-
-    public Mod(ModContext context)
-    {
-        _modLoader = context.ModLoader;
-        _hooks = context.Hooks;
-        _logger = context.Logger;
-        _owner = context.Owner;
-        _configuration = context.Configuration;
-        _modConfig = context.ModConfig;
-
-        if (LoadKatNative())
-        {
-            TouchKatWalk();
-            _logger.WriteLine("Kat SDK loaded, injecting code");
-            SetupLookHook();
-        }
-    }
-
+    /// <summary>
+    /// Hook installing code.
+    /// </summary>
     private unsafe void SetupLookHook()
     {
         // Signature:
@@ -158,13 +264,13 @@ public class Mod : ModBase // <= Do not Remove.
             "jmp rax"
         };
 
-        _logger.WriteLine($"Jump hook: {String.Join("\n", turnAdapterHook)}");
         try
         {
             rotationHook = _hooks!.CreateAsmHook(turnAdapterHook, (long)hook_jmp_address, AsmHookBehaviour.DoNotExecuteOriginal).Activate();
         }
         catch(Exception e)
         {
+            _logger.WriteLine($"Jump hook: {String.Join("\n", turnAdapterHook)}");
             _logger.WriteLine($"Exception: {e.ToString()}");
             throw;
         }
@@ -175,83 +281,11 @@ public class Mod : ModBase // <= Do not Remove.
         _logger.WriteLine($"Relative address written!");
     }
 
-    #region Hook helpers
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct Quaternion
-    {
-        public float x;
-        public float y;
-        public float z;
-        public float w;
-    };
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct Vector3
-    {
-        public float x;
-        public float y;
-        public float z;
-    };
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1, Size = 384)]
-    private unsafe struct KATTreadMillMemoryData
-    {
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
-        public string deviceName;
-        public byte connected;
-        public double lastUpdateTimePoint;
-        public Quaternion bodyRotationRaw;
-        public Vector3 moveSpeed;
-    };
-
-
-    private static float _lastAngle;
-    private static unsafe float* _angleDiff = (float*)Marshal.AllocHGlobal(sizeof(float));
-
-    [Function(CallingConventions.Microsoft)]
-    public delegate byte NoArgsRetByte();
-
-    private IReverseWrapper<NoArgsRetByte>? _GetTurnAngleDiffReverse;
-
-    private static byte _GetTurnAngleDiff()
-    {
-        KATTreadMillMemoryData data;
-        GetWalkStatusWrapper!(out data, 0);
-        float angle = (float)(2.0f * Math.Acos(data.bodyRotationRaw.w));
-        float diff = angle - _lastAngle;
-        if (Math.Abs(diff) > 0.001) {
-            unsafe { *_angleDiff = diff; }
-            _lastAngle = angle;
-            return 1;
-        }
-        return 0;
-    }
-    #endregion
-
-    private bool LoadKatNative()
-    {
-        hKatDll = LoadLibraryW("KATNativeSDK.dll");
-        _logger.WriteLine($"hKatDll = {hKatDll}");
-        if (hKatDll == 0)
-        {
-            throw new Exception("Can't load KATNativeSDK.dll");
-            // return false;
-        }
-
-        var addrGetWalkStatus = GetProcAddress(hKatDll, "GetWalkStatus");
-        _logger.WriteLine($"addrGetWalkStatus = {addrGetWalkStatus}");
-        if (addrGetWalkStatus == 0)
-        {
-            throw new Exception("Can't find address of GetWalkStatus");
-            // return false;
-        }
-
-        fGetWalkStatus = _hooks!.CreateFunction<FunGetWalkStatus>((long)addrGetWalkStatus);
-        GetWalkStatusWrapper = fGetWalkStatus.GetWrapper();
-
-        return true;
-    }
-
+    /// <summary>
+    /// Initialize the first rotation angle known to avoid jump-rotation.
+    /// 
+    /// Also dump debug data about treadmill connected for fun and debug.
+    /// </summary>
     private unsafe void TouchKatWalk()
     {
         KATTreadMillMemoryData newdata;
@@ -266,6 +300,26 @@ public class Mod : ModBase // <= Do not Remove.
             _logger.WriteLine($"Turn platform angle changed by: {*_angleDiff}.");
         else
             _logger.WriteLine("Platform angle hasn't changed.");
+    }
+    #endregion
+
+    public Mod(ModContext context)
+    {
+        _modLoader = context.ModLoader;
+        _hooks = context.Hooks;
+        _logger = context.Logger;
+        _owner = context.Owner;
+        _configuration = context.Configuration;
+        _modConfig = context.ModConfig;
+
+        if (LoadKatNative())
+        {
+            TouchKatWalk();
+            _logger.WriteLine("Kat SDK loaded, injecting code");
+            SetupLookHook();
+        }
+        // Comment out for release.
+        else { throw new Exception("Can't load SDK, bail on start"); }
     }
 
     #region Native Imports
